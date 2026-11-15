@@ -1,0 +1,18 @@
+[package]
+name = "shopcraft-core"
+description = "shopcraft L1: SQLite WAL physical POS store, split-tender checkout, storno, Z-Bon, and thermal receipt formatter."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+craft-biz.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
