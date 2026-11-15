@@ -1,0 +1,30 @@
+{
+  "manifest_version": "0.2",
+  "name": "shopcraft",
+  "display_name": "ShopCraft",
+  "version": "__VERSION__",
+  "description": "Local-first physical shop POS, Kassa, Z-Bon, and egui register",
+  "author": {
+    "name": "Sandra Schipal",
+    "url": "https://github.com/sandraschi"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sandraschi/shopcraft"
+  },
+  "license": "MIT OR Apache-2.0",
+  "server": {
+    "type": "binary",
+    "entry_point": "shopcraft.exe",
+    "mcp_config": {
+      "command": "${__dirname}/shopcraft.exe",
+      "args": ["mcp"]
+    }
+  },
+  "compatibility": { "platforms": ["win32"] },
+  "tools": [
+    { "name": "shop_status", "description": "Return POS register status" },
+    { "name": "shop_checkout", "description": "Complete a split-tender POS sale" },
+    { "name": "shop_shift_close", "description": "Close shift and issue immutable Z-Bon" }
+  ]
+}

@@ -1,0 +1,20 @@
+[package]
+name = "shopcraft-mcp"
+description = "shopcraft L2: single-binary POS CLI (--json) and MCP stdio server."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "shopcraft"
+path = "src/main.rs"
+
+[dependencies]
+shopcraft-core = { path = "../shopcraft-core" }
+craft-biz.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+
+[lints]
+workspace = true
