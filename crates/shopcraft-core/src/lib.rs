@@ -1,6 +1,11 @@
 pub mod error;
 pub mod models;
+pub mod modes;
 pub mod store;
+pub mod suite;
+
+#[cfg(test)]
+mod mode_rules;
 
 use craft_biz::bus::Bus;
 use craft_biz::mcp::{normalize_tool_name, tool, ToolHost};
@@ -149,7 +154,10 @@ impl ToolHost for ShopHost {
                     .get("receipt_no")
                     .and_then(Value::as_str)
                     .ok_or_else(|| "missing receipt_no".to_string())?;
-                let storno = self.store.storno_receipt(receipt_no).map_err(|e| e.to_string())?;
+                let storno = self
+                    .store
+                    .storno_receipt(receipt_no)
+                    .map_err(|e| e.to_string())?;
                 let _ = self.bus.emit(
                     "shopcraft",
                     "stockcraft",
@@ -167,7 +175,10 @@ impl ToolHost for ShopHost {
                     .get("counted_cash_cents")
                     .and_then(Value::as_i64)
                     .ok_or_else(|| "missing counted_cash_cents".to_string())?;
-                let zbon = self.store.close_shift(shift_id, counted).map_err(|e| e.to_string())?;
+                let zbon = self
+                    .store
+                    .close_shift(shift_id, counted)
+                    .map_err(|e| e.to_string())?;
                 let _ = self.bus.emit(
                     "shopcraft",
                     "buchcraft",

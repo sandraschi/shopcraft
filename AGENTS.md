@@ -1,11 +1,11 @@
 # AGENTS.md - shopcraft
 
-Local-first physical shop POS, cash drawer (Kassa), Z-Bon, and thermal receipt engine (`shopcraft`).
+Eight storefront modes in one repo (`shopcraft`): retail, web, amazon, subscription, digital, wholesale, ticket, rental.
 
 ## Layout
 
-- `crates/shopcraft-core` (L1): SQLite WAL store (POS catalog with EAN-13 barcodes, shifts, immutable receipts & `z_bons`, split-tender checkout, storno, 42-col ESC/POS receipt formatter), integer-cent `Money` math, `ToolHost` dispatch.
-- `crates/shopcraft-mcp` (L2): `shopcraft` binary. CLI (`--json`) and MCP `2024-11-05` stdio server.
+- `crates/shopcraft-core` (L1): `suite` dispatches mode-prefixed tools. Retail stays in `store.rs`. The other seven modes live under `src/modes/`.
+- `crates/shopcraft-mcp` (L2): `shopcraft` binary. `--mode` selects the CLI storefront. `mcp` serves every mode on one stdio server.
 - Shared kernel: `../craft-biz` (`Money`, `Bus`, `mcp`).
 
 ## Invariants

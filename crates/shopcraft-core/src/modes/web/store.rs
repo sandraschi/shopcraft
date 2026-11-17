@@ -1,0 +1,863 @@
+use std::path::{Path, PathBuf};
+
+use chrono::Utc;
+use craft_biz::money::Money;
+use rusqlite::{params, Connection, OptionalExtension};
+
+use super::error::{Result, ShopError};
+use super::models::{
+    CreateOrderInput, Order, OrderItem, Product, PromoCode, ShippingZone, ShopStatus,
+    StorefrontExport,
+};
+
+pub struct Store {
+    conn: Connection,
+    db_path: PathBuf,
+}
+
+impl Store {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let db_path = path.as_ref().to_path_buf();
+        if let Some(parent) = db_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let conn = Connection::open(&db_path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        let store = Self { conn, db_path };
+        store.init_schema()?;
+        Ok(store)
+    }
+
+    pub fn open_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        let store = Self {
+            conn,
+            db_path: PathBuf::from(":memory:"),
+        };
+        store.init_schema()?;
+        Ok(store)
+    }
+
+    fn init_schema(&self) -> Result<()> {
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS products (
+                sku TEXT PRIMARY KEY,
+                slug TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                subtitle TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL,
+                price_cents INTEGER NOT NULL CHECK(price_cents >= 0),
+                compare_at_cents INTEGER,
+                vat_rate_bps INTEGER NOT NULL DEFAULT 2000,
+                stock_qty INTEGER NOT NULL DEFAULT 0 CHECK(stock_qty >= 0),
+                badge TEXT,
+                accent_hex TEXT NOT NULL DEFAULT '#C2593F',
+                material TEXT NOT NULL DEFAULT '',
+                dimensions TEXT NOT NULL DEFAULT '',
+                image_url TEXT,
+                featured INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS promo_codes (
+                code TEXT PRIMARY KEY,
+                kind TEXT NOT NULL CHECK(kind IN ('PERCENT', 'FIXED_CENTS')),
+                value INTEGER NOT NULL CHECK(value > 0),
+                min_order_cents INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS shipping_zones (
+                zone_code TEXT PRIMARY KEY,
+                label TEXT NOT NULL,
+                base_rate_cents INTEGER NOT NULL CHECK(base_rate_cents >= 0),
+                free_over_cents INTEGER NOT NULL CHECK(free_over_cents >= 0),
+                eta_days TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS orders (
+                order_no TEXT PRIMARY KEY,
+                status TEXT NOT NULL CHECK(status IN ('NEW', 'PAID', 'PICKING', 'SHIPPED', 'CANCELLED', 'REFUNDED')),
+                customer_name TEXT NOT NULL,
+                customer_email TEXT NOT NULL,
+                shipping_address TEXT NOT NULL,
+                zone_code TEXT NOT NULL,
+                promo_code TEXT,
+                subtotal_cents INTEGER NOT NULL,
+                discount_cents INTEGER NOT NULL,
+                shipping_cents INTEGER NOT NULL,
+                vat_cents INTEGER NOT NULL,
+                total_cents INTEGER NOT NULL,
+                carrier TEXT,
+                tracking_no TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS order_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_no TEXT NOT NULL REFERENCES orders(order_no),
+                sku TEXT NOT NULL REFERENCES products(sku),
+                title TEXT NOT NULL,
+                qty INTEGER NOT NULL CHECK(qty > 0),
+                unit_price_cents INTEGER NOT NULL,
+                line_total_cents INTEGER NOT NULL,
+                vat_rate_bps INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS order_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_no TEXT NOT NULL REFERENCES orders(order_no),
+                event_type TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TRIGGER IF NOT EXISTS order_events_no_update
+            BEFORE UPDATE ON order_events
+            BEGIN
+                SELECT RAISE(ABORT, 'order_events is append-only');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS order_events_no_delete
+            BEFORE DELETE ON order_events
+            BEGIN
+                SELECT RAISE(ABORT, 'order_events is append-only');
+            END;
+            "#,
+        )?;
+        let _ = self
+            .conn
+            .execute("ALTER TABLE products ADD COLUMN image_url TEXT", []);
+        Ok(())
+    }
+
+    pub fn upsert_product(&self, p: &Product) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            r#"
+            INSERT INTO products (
+                sku, slug, title, subtitle, description, category,
+                price_cents, compare_at_cents, vat_rate_bps, stock_qty,
+                badge, accent_hex, material, dimensions, image_url, featured, active, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+            ON CONFLICT(sku) DO UPDATE SET
+                slug = excluded.slug,
+                title = excluded.title,
+                subtitle = excluded.subtitle,
+                description = excluded.description,
+                category = excluded.category,
+                price_cents = excluded.price_cents,
+                compare_at_cents = excluded.compare_at_cents,
+                vat_rate_bps = excluded.vat_rate_bps,
+                stock_qty = excluded.stock_qty,
+                badge = excluded.badge,
+                accent_hex = excluded.accent_hex,
+                material = excluded.material,
+                dimensions = excluded.dimensions,
+                image_url = excluded.image_url,
+                featured = excluded.featured,
+                active = excluded.active,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                p.sku,
+                p.slug,
+                p.title,
+                p.subtitle,
+                p.description,
+                p.category,
+                p.price_cents,
+                p.compare_at_cents,
+                p.vat_rate_bps,
+                p.stock_qty,
+                p.badge,
+                p.accent_hex,
+                p.material,
+                p.dimensions,
+                p.image_url,
+                i64::from(p.featured),
+                i64::from(p.active),
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_products(&self, category: Option<&str>, active_only: bool) -> Result<Vec<Product>> {
+        let mut sql = String::from(
+            "SELECT sku, slug, title, subtitle, description, category, price_cents, compare_at_cents,
+                    vat_rate_bps, stock_qty, badge, accent_hex, material, dimensions, image_url, featured, active
+             FROM products WHERE 1=1",
+        );
+        if active_only {
+            sql.push_str(" AND active = 1");
+        }
+        if category.is_some() {
+            sql.push_str(" AND lower(category) = lower(?1)");
+        }
+        sql.push_str(" ORDER BY featured DESC, title ASC");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = if let Some(cat) = category {
+            stmt.query_map(params![cat], Self::map_product)?
+        } else {
+            stmt.query_map([], Self::map_product)?
+        };
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    fn map_product(row: &rusqlite::Row<'_>) -> rusqlite::Result<Product> {
+        Ok(Product {
+            sku: row.get(0)?,
+            slug: row.get(1)?,
+            title: row.get(2)?,
+            subtitle: row.get(3)?,
+            description: row.get(4)?,
+            category: row.get(5)?,
+            price_cents: row.get(6)?,
+            compare_at_cents: row.get(7)?,
+            vat_rate_bps: row.get(8)?,
+            stock_qty: row.get(9)?,
+            badge: row.get(10)?,
+            accent_hex: row.get(11)?,
+            material: row.get(12)?,
+            dimensions: row.get(13)?,
+            image_url: row.get(14)?,
+            featured: row.get::<_, i64>(15)? != 0,
+            active: row.get::<_, i64>(16)? != 0,
+        })
+    }
+
+    pub fn upsert_promo(&self, promo: &PromoCode) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO promo_codes (code, kind, value, min_order_cents, active)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(code) DO UPDATE SET
+                kind = excluded.kind,
+                value = excluded.value,
+                min_order_cents = excluded.min_order_cents,
+                active = excluded.active
+            "#,
+            params![
+                promo.code.to_uppercase(),
+                promo.kind,
+                promo.value,
+                promo.min_order_cents,
+                i64::from(promo.active)
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_shipping_zone(&self, z: &ShippingZone) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO shipping_zones (zone_code, label, base_rate_cents, free_over_cents, eta_days)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(zone_code) DO UPDATE SET
+                label = excluded.label,
+                base_rate_cents = excluded.base_rate_cents,
+                free_over_cents = excluded.free_over_cents,
+                eta_days = excluded.eta_days
+            "#,
+            params![
+                z.zone_code.to_uppercase(),
+                z.label,
+                z.base_rate_cents,
+                z.free_over_cents,
+                z.eta_days
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_shipping_zones(&self) -> Result<Vec<ShippingZone>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT zone_code, label, base_rate_cents, free_over_cents, eta_days FROM shipping_zones ORDER BY base_rate_cents ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ShippingZone {
+                zone_code: row.get(0)?,
+                label: row.get(1)?,
+                base_rate_cents: row.get(2)?,
+                free_over_cents: row.get(3)?,
+                eta_days: row.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn create_order(&mut self, input: &CreateOrderInput) -> Result<Order> {
+        if input.items.is_empty() {
+            return Err(ShopError::Invalid(
+                "order must contain at least one item".into(),
+            ));
+        }
+        if input.customer_name.trim().is_empty() || input.customer_email.trim().is_empty() {
+            return Err(ShopError::Invalid(
+                "customer name and email are required".into(),
+            ));
+        }
+
+        let tx = self.conn.transaction()?;
+        let zone_code = input.zone_code.to_uppercase();
+        let zone: ShippingZone = tx
+            .query_row(
+                "SELECT zone_code, label, base_rate_cents, free_over_cents, eta_days FROM shipping_zones WHERE zone_code = ?1",
+                params![zone_code],
+                |r| {
+                    Ok(ShippingZone {
+                        zone_code: r.get(0)?,
+                        label: r.get(1)?,
+                        base_rate_cents: r.get(2)?,
+                        free_over_cents: r.get(3)?,
+                        eta_days: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| ShopError::NotFound(format!("shipping zone {zone_code}")))?;
+
+        let mut subtotal = Money::ZERO;
+        let mut vat_total = Money::ZERO;
+        let mut resolved_items = Vec::with_capacity(input.items.len());
+
+        for item in &input.items {
+            if item.qty <= 0 {
+                return Err(ShopError::Invalid(format!("invalid qty for {}", item.sku)));
+            }
+            let prod: (String, i64, i64, i64, i64) = tx
+                .query_row(
+                    "SELECT title, price_cents, vat_rate_bps, stock_qty, active FROM products WHERE sku = ?1",
+                    params![item.sku],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .optional()?
+                .ok_or_else(|| ShopError::NotFound(format!("product {}", item.sku)))?;
+
+            let (title, price_cents, vat_rate_bps, stock_qty, active) = prod;
+            if active == 0 {
+                return Err(ShopError::Invalid(format!(
+                    "product {} is inactive",
+                    item.sku
+                )));
+            }
+            if stock_qty < item.qty {
+                return Err(ShopError::InsufficientStock {
+                    sku: item.sku.clone(),
+                    requested: item.qty,
+                    available: stock_qty,
+                });
+            }
+
+            tx.execute(
+                "UPDATE products SET stock_qty = stock_qty - ?1 WHERE sku = ?2",
+                params![item.qty, item.sku],
+            )?;
+
+            let line_cents = price_cents * item.qty;
+            subtotal = subtotal.checked_add(Money::from_cents(line_cents))?;
+
+            // Prices are EU gross (VAT included): vat = gross * rate / (10000 + rate)
+            let line_vat =
+                (line_cents * vat_rate_bps + (10_000 + vat_rate_bps) / 2) / (10_000 + vat_rate_bps);
+            vat_total = vat_total.checked_add(Money::from_cents(line_vat))?;
+
+            resolved_items.push(OrderItem {
+                sku: item.sku.clone(),
+                title,
+                qty: item.qty,
+                unit_price_cents: price_cents,
+                line_total_cents: line_cents,
+                vat_rate_bps,
+            });
+        }
+
+        let mut discount_cents: i64 = 0;
+        let mut applied_promo: Option<String> = None;
+        if let Some(code_raw) = &input.promo_code {
+            let code = code_raw.trim().to_uppercase();
+            if !code.is_empty() {
+                let promo: Option<(String, i64, i64)> = tx
+                    .query_row(
+                        "SELECT kind, value, min_order_cents FROM promo_codes WHERE code = ?1 AND active = 1",
+                        params![code],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .optional()?;
+                let (kind, val, min_order) = promo
+                    .ok_or_else(|| ShopError::Invalid(format!("invalid promo code {code}")))?;
+                if subtotal.cents() < min_order {
+                    return Err(ShopError::Invalid(format!(
+                        "promo {code} requires minimum order of {} cents",
+                        min_order
+                    )));
+                }
+                discount_cents = match kind.as_str() {
+                    "PERCENT" => (subtotal.cents() * val + 50) / 100,
+                    "FIXED_CENTS" => val.min(subtotal.cents()),
+                    _ => 0,
+                };
+                applied_promo = Some(code);
+            }
+        }
+
+        let discounted_subtotal = (subtotal.cents() - discount_cents).max(0);
+        let shipping_cents = if discounted_subtotal >= zone.free_over_cents {
+            0
+        } else {
+            zone.base_rate_cents
+        };
+        let total_cents = discounted_subtotal + shipping_cents;
+
+        let count: i64 = tx.query_row("SELECT COUNT(*) FROM orders", [], |r| r.get(0))?;
+        let now = Utc::now();
+        let order_no = format!("WSC-{}-{:04}", now.format("%Y%m%d"), count + 1);
+        let created_at = now.to_rfc3339();
+
+        tx.execute(
+            r#"
+            INSERT INTO orders (
+                order_no, status, customer_name, customer_email, shipping_address,
+                zone_code, promo_code, subtotal_cents, discount_cents, shipping_cents,
+                vat_cents, total_cents, carrier, tracking_no, created_at
+            ) VALUES (?1, 'NEW', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, NULL, ?12)
+            "#,
+            params![
+                order_no,
+                input.customer_name,
+                input.customer_email,
+                input.shipping_address,
+                zone.zone_code,
+                applied_promo,
+                subtotal.cents(),
+                discount_cents,
+                shipping_cents,
+                vat_total.cents(),
+                total_cents,
+                created_at
+            ],
+        )?;
+
+        for item in &resolved_items {
+            tx.execute(
+                r#"
+                INSERT INTO order_items (order_no, sku, title, qty, unit_price_cents, line_total_cents, vat_rate_bps)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "#,
+                params![
+                    order_no,
+                    item.sku,
+                    item.title,
+                    item.qty,
+                    item.unit_price_cents,
+                    item.line_total_cents,
+                    item.vat_rate_bps
+                ],
+            )?;
+        }
+
+        tx.execute(
+            "INSERT INTO order_events (order_no, event_type, detail, created_at) VALUES (?1, 'ORDER_CREATED', ?2, ?3)",
+            params![order_no, format!("total_cents={total_cents}"), created_at],
+        )?;
+
+        tx.commit()?;
+
+        self.get_order(&order_no)
+    }
+
+    pub fn get_order(&self, order_no: &str) -> Result<Order> {
+        let mut order: Order = self
+            .conn
+            .query_row(
+                r#"
+                SELECT order_no, status, customer_name, customer_email, shipping_address,
+                       zone_code, promo_code, subtotal_cents, discount_cents, shipping_cents,
+                       vat_cents, total_cents, carrier, tracking_no, created_at
+                FROM orders WHERE order_no = ?1
+                "#,
+                params![order_no],
+                |r| {
+                    Ok(Order {
+                        order_no: r.get(0)?,
+                        status: r.get(1)?,
+                        customer_name: r.get(2)?,
+                        customer_email: r.get(3)?,
+                        shipping_address: r.get(4)?,
+                        zone_code: r.get(5)?,
+                        promo_code: r.get(6)?,
+                        subtotal_cents: r.get(7)?,
+                        discount_cents: r.get(8)?,
+                        shipping_cents: r.get(9)?,
+                        vat_cents: r.get(10)?,
+                        total_cents: r.get(11)?,
+                        carrier: r.get(12)?,
+                        tracking_no: r.get(13)?,
+                        created_at: r.get(14)?,
+                        items: Vec::new(),
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| ShopError::NotFound(format!("order {order_no}")))?;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT sku, title, qty, unit_price_cents, line_total_cents, vat_rate_bps FROM order_items WHERE order_no = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![order_no], |r| {
+            Ok(OrderItem {
+                sku: r.get(0)?,
+                title: r.get(1)?,
+                qty: r.get(2)?,
+                unit_price_cents: r.get(3)?,
+                line_total_cents: r.get(4)?,
+                vat_rate_bps: r.get(5)?,
+            })
+        })?;
+        for row in rows {
+            order.items.push(row?);
+        }
+        Ok(order)
+    }
+
+    pub fn list_orders(&self, status: Option<&str>) -> Result<Vec<Order>> {
+        let mut sql = String::from("SELECT order_no FROM orders WHERE 1=1");
+        if status.is_some() {
+            sql.push_str(" AND upper(status) = upper(?1)");
+        }
+        sql.push_str(" ORDER BY created_at DESC");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let nos: Vec<String> = if let Some(s) = status {
+            stmt.query_map(params![s], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            stmt.query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut out = Vec::with_capacity(nos.len());
+        for no in nos {
+            out.push(self.get_order(&no)?);
+        }
+        Ok(out)
+    }
+
+    pub fn mark_paid(&self, order_no: &str) -> Result<Order> {
+        self.transition_order(
+            order_no,
+            &["NEW"],
+            "PAID",
+            "PAYMENT_CONFIRMED",
+            "marked paid",
+        )?;
+        self.get_order(order_no)
+    }
+
+    pub fn ship_order(&self, order_no: &str, carrier: &str, tracking_no: &str) -> Result<Order> {
+        let now = Utc::now().to_rfc3339();
+        let current: String = self
+            .conn
+            .query_row(
+                "SELECT status FROM orders WHERE order_no = ?1",
+                params![order_no],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| ShopError::NotFound(format!("order {order_no}")))?;
+
+        if current != "PAID" && current != "PICKING" {
+            return Err(ShopError::InvalidTransition {
+                from: current,
+                to: "SHIPPED".into(),
+            });
+        }
+
+        self.conn.execute(
+            "UPDATE orders SET status = 'SHIPPED', carrier = ?1, tracking_no = ?2 WHERE order_no = ?3",
+            params![carrier, tracking_no, order_no],
+        )?;
+        self.conn.execute(
+            "INSERT INTO order_events (order_no, event_type, detail, created_at) VALUES (?1, 'ORDER_SHIPPED', ?2, ?3)",
+            params![order_no, format!("{carrier}:{tracking_no}"), now],
+        )?;
+        self.get_order(order_no)
+    }
+
+    fn transition_order(
+        &self,
+        order_no: &str,
+        allowed_from: &[&str],
+        to: &str,
+        event_type: &str,
+        detail: &str,
+    ) -> Result<()> {
+        let current: String = self
+            .conn
+            .query_row(
+                "SELECT status FROM orders WHERE order_no = ?1",
+                params![order_no],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| ShopError::NotFound(format!("order {order_no}")))?;
+
+        if !allowed_from.contains(&current.as_str()) {
+            return Err(ShopError::InvalidTransition {
+                from: current,
+                to: to.into(),
+            });
+        }
+
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE orders SET status = ?1 WHERE order_no = ?2",
+            params![to, order_no],
+        )?;
+        self.conn.execute(
+            "INSERT INTO order_events (order_no, event_type, detail, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![order_no, event_type, detail, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn status(&self) -> Result<ShopStatus> {
+        let active_products: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM products WHERE active = 1", [], |r| {
+                    r.get(0)
+                })?;
+        let total_stock_units: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(stock_qty), 0) FROM products WHERE active = 1",
+            [],
+            |r| r.get(0),
+        )?;
+        let open_orders: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM orders WHERE status IN ('NEW', 'PAID', 'PICKING')",
+            [],
+            |r| r.get(0),
+        )?;
+        let total_revenue_cents: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(total_cents), 0) FROM orders WHERE status IN ('PAID', 'PICKING', 'SHIPPED')",
+            [],
+            |r| r.get(0),
+        )?;
+
+        Ok(ShopStatus {
+            db_path: self.db_path.display().to_string(),
+            active_products,
+            total_stock_units,
+            open_orders,
+            total_revenue_cents,
+        })
+    }
+
+    pub fn export_storefront(&self, shop_name: &str, tagline: &str) -> Result<StorefrontExport> {
+        let products = self.list_products(None, true)?;
+        let mut categories = Vec::new();
+        for p in &products {
+            if !categories.contains(&p.category) {
+                categories.push(p.category.clone());
+            }
+        }
+        let shipping_zones = self.list_shipping_zones()?;
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT code FROM promo_codes WHERE active = 1 ORDER BY code ASC")?;
+        let promo_hints = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(StorefrontExport {
+            shop_name: shop_name.to_string(),
+            tagline: tagline.to_string(),
+            currency: "EUR".to_string(),
+            generated_at: Utc::now().to_rfc3339(),
+            categories,
+            products,
+            shipping_zones,
+            promo_hints,
+        })
+    }
+
+    pub fn seed_demo(&self) -> Result<usize> {
+        let products = vec![
+            Product {
+                sku: "CER-VASE-01".into(),
+                slug: "fluted-stoneware-vase".into(),
+                title: "Fluted Stoneware Vase".into(),
+                subtitle: "Wheel-thrown matte sandstone".into(),
+                description: "Hand-thrown in small batches using mineral-rich clay and finished in a tactile raw sandstone glaze. Watertight interior for fresh botanicals.".into(),
+                category: "Ceramics".into(),
+                price_cents: 6800,
+                compare_at_cents: Some(8200),
+                vat_rate_bps: 2000,
+                stock_qty: 18,
+                badge: Some("Bestseller".into()),
+                accent_hex: "#C2593F".into(),
+                material: "High-fire Stoneware".into(),
+                dimensions: "24 x 11 cm".into(),
+                image_url: Some("assets/cer-vase-01.jpg".into()),
+                featured: true,
+                active: true,
+            },
+            Product {
+                sku: "LGT-LAMP-02".into(),
+                slug: "brushed-brass-atelier-lamp".into(),
+                title: "Atelier Desk Lamp".into(),
+                subtitle: "Warm-dim 2700K spun aluminum".into(),
+                description: "Precision-spun shade with a weighted cast-iron base and braided linen cord. Glare-free task lighting for studios and reading corners.".into(),
+                category: "Lighting".into(),
+                price_cents: 18900,
+                compare_at_cents: None,
+                vat_rate_bps: 2000,
+                stock_qty: 7,
+                badge: Some("Low Stock".into()),
+                accent_hex: "#B47B38".into(),
+                material: "Spun Aluminum & Brass".into(),
+                dimensions: "41 x 18 cm".into(),
+                image_url: Some("assets/lgt-lamp-02.jpg".into()),
+                featured: true,
+                active: true,
+            },
+            Product {
+                sku: "TXT-THRW-03".into(),
+                slug: "alpine-merino-throw".into(),
+                title: "Alpine Merino Throw".into(),
+                subtitle: "Unbleached herringbone weave".into(),
+                description: "Loomed from 100% Austrian and South Tyrolean virgin wool. Naturally thermoregulating, soft-brushed, with hand-knotted fringe.".into(),
+                category: "Textiles".into(),
+                price_cents: 12400,
+                compare_at_cents: Some(14500),
+                vat_rate_bps: 2000,
+                stock_qty: 14,
+                badge: Some("New Season".into()),
+                accent_hex: "#4B6B5A".into(),
+                material: "100% Virgin Merino".into(),
+                dimensions: "140 x 200 cm".into(),
+                image_url: Some("assets/txt-thrw-03.jpg".into()),
+                featured: true,
+                active: true,
+            },
+            Product {
+                sku: "WRK-TRAY-04".into(),
+                slug: "smoked-oak-valet-tray".into(),
+                title: "Smoked Oak Valet Tray".into(),
+                subtitle: "CNC-milled solid European oak".into(),
+                description: "Carved from a single block of kiln-dried European oak, fumed for deep grain contrast and sealed with organic beeswax.".into(),
+                category: "Workspace".into(),
+                price_cents: 4900,
+                compare_at_cents: None,
+                vat_rate_bps: 2000,
+                stock_qty: 32,
+                badge: None,
+                accent_hex: "#5C4B3B".into(),
+                material: "Fumed European Oak".into(),
+                dimensions: "26 x 14 x 2.2 cm".into(),
+                image_url: None,
+                featured: false,
+                active: true,
+            },
+            Product {
+                sku: "CER-MUG-05".into(),
+                slug: "espresso-tumbler-pair".into(),
+                title: "Espresso Tumbler Pair".into(),
+                subtitle: "Set of 2 speckled basalt cups".into(),
+                description: "Thick-walled handleless tumblers engineered to retain heat while staying comfortable in the palm. Dishwasher safe.".into(),
+                category: "Ceramics".into(),
+                price_cents: 3600,
+                compare_at_cents: None,
+                vat_rate_bps: 2000,
+                stock_qty: 25,
+                badge: Some("Set of 2".into()),
+                accent_hex: "#2E3440".into(),
+                material: "Basalt Porcelain".into(),
+                dimensions: "90 ml each".into(),
+                image_url: None,
+                featured: false,
+                active: true,
+            },
+            Product {
+                sku: "WRK-NOTE-06".into(),
+                slug: "linen-bound-studio-notebook".into(),
+                title: "Linen Studio Notebook".into(),
+                subtitle: "192 pages, 120gsm Munken paper".into(),
+                description: "Lay-flat Smyth-sewn binding wrapped in Belgian bookcloth. Subtle 4mm dot grid suited for fountain pens and sketching.".into(),
+                category: "Workspace".into(),
+                price_cents: 2400,
+                compare_at_cents: None,
+                vat_rate_bps: 1000,
+                stock_qty: 44,
+                badge: None,
+                accent_hex: "#3B5978".into(),
+                material: "Belgian Linen & Munken".into(),
+                dimensions: "A5 (148 x 210 mm)".into(),
+                image_url: None,
+                featured: false,
+                active: true,
+            },
+        ];
+
+        for p in &products {
+            self.upsert_product(p)?;
+        }
+
+        self.upsert_promo(&PromoCode {
+            code: "WELCOME10".into(),
+            kind: "PERCENT".into(),
+            value: 10,
+            min_order_cents: 3000,
+            active: true,
+        })?;
+        self.upsert_promo(&PromoCode {
+            code: "ATELIER15".into(),
+            kind: "FIXED_CENTS".into(),
+            value: 1500,
+            min_order_cents: 10000,
+            active: true,
+        })?;
+
+        self.upsert_shipping_zone(&ShippingZone {
+            zone_code: "AT".into(),
+            label: "Austria (Post.at)".into(),
+            base_rate_cents: 590,
+            free_over_cents: 9000,
+            eta_days: "1-2 business days".into(),
+        })?;
+        self.upsert_shipping_zone(&ShippingZone {
+            zone_code: "DE".into(),
+            label: "Germany (DHL)".into(),
+            base_rate_cents: 790,
+            free_over_cents: 11000,
+            eta_days: "2-3 business days".into(),
+        })?;
+        self.upsert_shipping_zone(&ShippingZone {
+            zone_code: "EU".into(),
+            label: "European Union".into(),
+            base_rate_cents: 1290,
+            free_over_cents: 15000,
+            eta_days: "3-5 business days".into(),
+        })?;
+
+        Ok(products.len())
+    }
+}

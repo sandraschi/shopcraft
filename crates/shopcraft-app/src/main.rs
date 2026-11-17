@@ -12,30 +12,91 @@ use craft_biz_ui::widgets::{self, Kpi};
 use egui::{Grid, RichText, ScrollArea, Ui};
 use serde_json::{json, Value};
 use shopcraft_core::models::{PosItem, PosStatus, Shift};
-use shopcraft_core::store::PosStore;
-use shopcraft_core::ShopHost;
+use shopcraft_core::suite::ShopSuite;
 
 struct ShopApp {
-    host: ShopHost,
+    suite: ShopSuite,
     items: Vec<PosItem>,
     status: Option<PosStatus>,
     active_shift: Option<Shift>,
     last_receipt_text: String,
+    mode_status: String,
+    loaded_view: usize,
 }
+
+struct ModePage {
+    title: &'static str,
+    status_tool: &'static str,
+    seed_tool: &'static str,
+}
+
+const PAGES: &[ModePage] = &[
+    ModePage {
+        title: "Retail POS",
+        status_tool: "shop_status",
+        seed_tool: "shop_seed",
+    },
+    ModePage {
+        title: "Web",
+        status_tool: "webshop_status",
+        seed_tool: "webshop_seed",
+    },
+    ModePage {
+        title: "Amazon",
+        status_tool: "amazon_status",
+        seed_tool: "amazon_seed",
+    },
+    ModePage {
+        title: "Subscription",
+        status_tool: "sub_status",
+        seed_tool: "sub_seed",
+    },
+    ModePage {
+        title: "Digital",
+        status_tool: "digital_status",
+        seed_tool: "digital_seed",
+    },
+    ModePage {
+        title: "Wholesale",
+        status_tool: "wholesale_status",
+        seed_tool: "wholesale_seed",
+    },
+    ModePage {
+        title: "Ticket",
+        status_tool: "ticket_status",
+        seed_tool: "ticket_seed",
+    },
+    ModePage {
+        title: "Rental",
+        status_tool: "rental_status",
+        seed_tool: "rental_seed",
+    },
+];
 
 impl ShopApp {
     fn open(path: &Path) -> Result<Self, String> {
-        let store = PosStore::open(path).map_err(|e| e.to_string())?;
-        let host = ShopHost::new(store);
+        let suite = ShopSuite::open(path)?;
         let mut app = Self {
-            host,
+            suite,
             items: Vec::new(),
             status: None,
             active_shift: None,
             last_receipt_text: String::new(),
+            mode_status: String::new(),
+            loaded_view: usize::MAX,
         };
         app.reload()?;
         Ok(app)
+    }
+
+    fn refresh_mode(&mut self, view: usize) {
+        let Some(page) = PAGES.get(view) else {
+            return;
+        };
+        self.mode_status = match self.suite.call(page.status_tool, &json!({})) {
+            Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
+            Err(err) => err,
+        };
     }
 
     fn view_register(&mut self, ui: &mut Ui, f: &mut Frame) {
@@ -49,7 +110,10 @@ impl ShopApp {
                         st.open_shift.clone().unwrap_or_else(|| "None".into()),
                     ),
                     Kpi::new("Receipts", st.total_receipts.to_string()),
-                    Kpi::new("Gross Sales", Money::from_cents(st.gross_sales_cents).to_string()),
+                    Kpi::new(
+                        "Gross Sales",
+                        Money::from_cents(st.gross_sales_cents).to_string(),
+                    ),
                 ],
             );
             ui.add_space(10.0);
@@ -58,7 +122,7 @@ impl ShopApp {
         ui.horizontal(|ui| {
             if self.active_shift.is_none() {
                 if ui.button("Open Shift (Lukas, EUR 100.00)").clicked() {
-                    match self.host.call(
+                    match self.suite.call(
                         "shop_shift_open",
                         &json!({ "clerk_name": "Lukas", "opening_float_cents": 10000 }),
                     ) {
@@ -71,7 +135,7 @@ impl ShopApp {
                 }
             } else if let Some(sh) = self.active_shift.clone() {
                 if ui.button("Close Shift & Print Z-Bon").clicked() {
-                    match self.host.call(
+                    match self.suite.call(
                         "shop_shift_close",
                         &json!({ "shift_id": sh.shift_id, "counted_cash_cents": sh.expected_cash_cents }),
                     ) {
@@ -109,7 +173,7 @@ impl ShopApp {
                         .clicked()
                     {
                         if let Some(sh) = &self.active_shift {
-                            match self.host.call(
+                            match self.suite.call(
                                 "shop_checkout",
                                 &json!({
                                     "shift_id": sh.shift_id,
@@ -120,9 +184,11 @@ impl ShopApp {
                                 }),
                             ) {
                                 Ok(val) => {
-                                    if let Some(rno) = val.get("receipt_no").and_then(Value::as_str) {
+                                    if let Some(rno) = val.get("receipt_no").and_then(Value::as_str)
+                                    {
                                         self.last_receipt_text = self
-                                            .host
+                                            .suite
+                                            .retail
                                             .store
                                             .format_receipt_text(rno)
                                             .unwrap_or_default();
@@ -137,19 +203,40 @@ impl ShopApp {
                     ui.end_row();
                 }
             });
+            ui.add_space(12.0);
+            ui.label(RichText::new("42-Col ESC/POS Receipt Preview").strong());
+            let text = if self.last_receipt_text.is_empty() {
+                "Complete a sale to preview the thermal receipt."
+            } else {
+                self.last_receipt_text.as_str()
+            };
+            ui.monospace(text);
         });
     }
 
-    fn view_receipt_preview(&self, ui: &mut Ui) {
-        ui.label(RichText::new("42-Col ESC/POS Receipt Preview").strong());
-        ui.add_space(6.0);
-        let text = if self.last_receipt_text.is_empty() {
-            "Complete a sale in Register view to preview the thermal receipt."
-        } else {
-            &self.last_receipt_text
+    fn view_mode(&mut self, ui: &mut Ui, f: &mut Frame, view: usize) {
+        let Some(page) = PAGES.get(view) else {
+            return;
         };
+        ui.heading(page.title);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("Refresh status").clicked() {
+                self.refresh_mode(view);
+            }
+            if ui.button("Seed demo").clicked() {
+                match self.suite.call(page.seed_tool, &json!({})) {
+                    Ok(_) => {
+                        self.refresh_mode(view);
+                        f.toast(format!("{} seeded", page.title), Tone::Teal);
+                    }
+                    Err(err) => f.toast(err, Tone::Danger),
+                }
+            }
+        });
+        ui.add_space(8.0);
         ScrollArea::vertical().show(ui, |ui| {
-            ui.monospace(text);
+            ui.monospace(&self.mode_status);
         });
     }
 }
@@ -168,18 +255,31 @@ impl SuiteApp for ShopApp {
         env!("CARGO_PKG_VERSION")
     }
     fn tools(&self) -> Vec<Value> {
-        self.host.tools()
+        self.suite.tools()
     }
     fn call(&mut self, tool: &str, args: &Value) -> Result<Value, String> {
-        let out = self.host.call(tool, args)?;
+        let out = self.suite.call(tool, args)?;
         let _ = self.reload();
+        if self.loaded_view != 0 && self.loaded_view != usize::MAX {
+            self.refresh_mode(self.loaded_view);
+        }
         Ok(out)
     }
     fn reload(&mut self) -> Result<(), String> {
-        self.items = self.host.store.list_items(None).map_err(|e| e.to_string())?;
-        let st = self.host.store.status().map_err(|e| e.to_string())?;
+        self.items = self
+            .suite
+            .retail
+            .store
+            .list_items(None)
+            .map_err(|e| e.to_string())?;
+        let st = self
+            .suite
+            .retail
+            .store
+            .status()
+            .map_err(|e| e.to_string())?;
         self.active_shift = match &st.open_shift {
-            Some(id) => self.host.store.get_shift(id).ok(),
+            Some(id) => self.suite.retail.store.get_shift(id).ok(),
             None => None,
         };
         self.status = Some(st);
@@ -187,20 +287,33 @@ impl SuiteApp for ShopApp {
     }
     fn nav(&self, _f: &Frame) -> Vec<NavEntry> {
         vec![
-            NavEntry::new("R", "Register")
-                .group("POS")
+            NavEntry::new("R", "Retail")
+                .group("Modes")
                 .badge(self.items.len(), Tone::Warn),
-            NavEntry::new("P", "Receipt Preview"),
+            NavEntry::new("W", "Web").group("Modes"),
+            NavEntry::new("A", "Amazon").group("Modes"),
+            NavEntry::new("S", "Subscription").group("Modes"),
+            NavEntry::new("D", "Digital").group("Modes"),
+            NavEntry::new("B", "Wholesale").group("Modes"),
+            NavEntry::new("T", "Ticket").group("Modes"),
+            NavEntry::new("N", "Rental").group("Modes"),
         ]
     }
     fn view(&mut self, ui: &mut Ui, view: usize, f: &mut Frame) {
-        match view {
-            0 => self.view_register(ui, f),
-            _ => self.view_receipt_preview(ui),
+        if view != self.loaded_view {
+            self.loaded_view = view;
+            if view != 0 {
+                self.refresh_mode(view);
+            }
+        }
+        if view == 0 {
+            self.view_register(ui, f);
+        } else {
+            self.view_mode(ui, f, view);
         }
     }
     fn bus(&self) -> &Bus {
-        &self.host.bus
+        &self.suite.retail.bus
     }
     fn wiring(&self) -> Wiring {
         (
@@ -221,7 +334,7 @@ fn default_db() -> PathBuf {
     let base = std::env::var("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."));
-    base.join("shopcraft").join("shopcraft.db")
+    base.join("shopcraft")
 }
 
 fn main() -> ExitCode {
