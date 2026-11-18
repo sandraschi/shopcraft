@@ -653,6 +653,15 @@ impl Store {
         Ok(orders)
     }
 
+    pub fn sales_by_day(&self) -> Result<Vec<crate::sales::SalesPoint>> {
+        crate::sales::by_day(
+            &self.conn,
+            "SELECT substr(created_at, 1, 10), COALESCE(SUM(total_cents), 0), COUNT(*)
+             FROM purchase_orders WHERE status != 'Cancelled' GROUP BY 1 ORDER BY 1",
+        )
+        .map_err(Into::into)
+    }
+
     pub fn status(&self) -> Result<WholesaleStatus> {
         let active_products: i64 =
             self.conn

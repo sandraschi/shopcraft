@@ -321,6 +321,15 @@ impl Store {
         })
     }
 
+    pub fn sales_by_day(&self) -> Result<Vec<crate::sales::SalesPoint>> {
+        crate::sales::by_day(
+            &self.conn,
+            "SELECT substr(created_at, 1, 10), COALESCE(SUM(total_cents), 0), COUNT(*)
+             FROM ticket_orders WHERE status != 'refunded' GROUP BY 1 ORDER BY 1",
+        )
+        .map_err(Into::into)
+    }
+
     pub fn status(&self) -> Result<TicketStatus> {
         let events_count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM event_tiers WHERE active = 1",

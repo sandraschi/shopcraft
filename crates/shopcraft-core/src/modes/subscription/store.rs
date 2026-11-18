@@ -420,6 +420,15 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn sales_by_day(&self) -> Result<Vec<crate::sales::SalesPoint>> {
+        crate::sales::by_day(
+            &self.conn,
+            "SELECT substr(billing_date, 1, 10), COALESCE(SUM(amount_cents), 0), COUNT(*)
+             FROM renewal_cycles WHERE kind = 'Billed' GROUP BY 1 ORDER BY 1",
+        )
+        .map_err(Into::into)
+    }
+
     pub fn status(&self) -> Result<SubStatus> {
         let active_plans: i64 =
             self.conn

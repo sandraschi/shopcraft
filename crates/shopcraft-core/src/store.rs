@@ -5,7 +5,10 @@ use craft_biz::money::Money;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::{PosError, Result};
-use crate::models::{CheckoutInput, PosItem, PosStatus, Receipt, ReceiptLine, Shift, ZBon};
+use crate::models::{
+    CalendarDay, CheckoutInput, Employee, OpeningHour, PosItem, PosStatus, Receipt, ReceiptLine,
+    Shift, ZBon,
+};
 
 pub struct PosStore {
     conn: Connection,
@@ -93,6 +96,28 @@ impl PosStore {
                 unit_price_cents INTEGER NOT NULL,
                 line_total_cents INTEGER NOT NULL,
                 vat_rate_bps INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS opening_hours (
+                weekday INTEGER PRIMARY KEY CHECK(weekday >= 0 AND weekday <= 6),
+                open_minute INTEGER NOT NULL CHECK(open_minute >= 0 AND open_minute < 1440),
+                close_minute INTEGER NOT NULL CHECK(close_minute >= 0 AND close_minute < 1440),
+                closed INTEGER NOT NULL CHECK(closed IN (0, 1))
+            );
+
+            CREATE TABLE IF NOT EXISTS calendar_days (
+                day TEXT PRIMARY KEY,
+                kind TEXT NOT NULL CHECK(kind IN ('closed', 'short', 'open')),
+                open_minute INTEGER CHECK(open_minute IS NULL OR (open_minute >= 0 AND open_minute < 1440)),
+                close_minute INTEGER CHECK(close_minute IS NULL OR (close_minute >= 0 AND close_minute < 1440)),
+                note TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS employees (
+                employee_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                role TEXT NOT NULL,
+                active INTEGER NOT NULL CHECK(active IN (0, 1))
             );
 
             CREATE TABLE IF NOT EXISTS z_bons (
@@ -767,6 +792,15 @@ impl PosStore {
         Ok(out)
     }
 
+    pub fn sales_by_day(&self) -> Result<Vec<crate::sales::SalesPoint>> {
+        crate::sales::by_day(
+            &self.conn,
+            "SELECT substr(created_at, 1, 10), COALESCE(SUM(total_cents), 0), COUNT(*)
+             FROM receipts GROUP BY 1 ORDER BY 1",
+        )
+        .map_err(Into::into)
+    }
+
     pub fn status(&self) -> Result<PosStatus> {
         let active_items: i64 =
             self.conn
@@ -796,6 +830,232 @@ impl PosStore {
             total_receipts,
             gross_sales_cents,
         })
+    }
+
+    pub fn list_opening_hours(&self) -> Result<Vec<OpeningHour>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT weekday, open_minute, close_minute, closed FROM opening_hours ORDER BY weekday",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(OpeningHour {
+                weekday: r.get(0)?,
+                open_minute: r.get(1)?,
+                close_minute: r.get(2)?,
+                closed: r.get::<_, i64>(3)? != 0,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn set_opening_hours(
+        &self,
+        weekday: i64,
+        open_minute: i64,
+        close_minute: i64,
+        closed: bool,
+    ) -> Result<()> {
+        if !(0..=6).contains(&weekday) {
+            return Err(PosError::Invalid(
+                "weekday must be 0 (Monday) through 6 (Sunday)".into(),
+            ));
+        }
+        if !closed {
+            check_span(open_minute, close_minute)?;
+        }
+        self.conn.execute(
+            r#"
+            INSERT INTO opening_hours (weekday, open_minute, close_minute, closed)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(weekday) DO UPDATE SET
+                open_minute = excluded.open_minute,
+                close_minute = excluded.close_minute,
+                closed = excluded.closed
+            "#,
+            params![weekday, open_minute, close_minute, i64::from(closed)],
+        )?;
+        Ok(())
+    }
+
+    pub fn install_standard_week(&self) -> Result<()> {
+        for weekday in 0..5 {
+            self.set_opening_hours(weekday, 10 * 60, 18 * 60, false)?;
+        }
+        self.set_opening_hours(5, 10 * 60, 16 * 60, false)?;
+        self.set_opening_hours(6, 0, 0, true)?;
+        Ok(())
+    }
+
+    pub fn list_calendar_days(&self) -> Result<Vec<CalendarDay>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT day, kind, open_minute, close_minute, note FROM calendar_days ORDER BY day",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(CalendarDay {
+                day: r.get(0)?,
+                kind: r.get(1)?,
+                open_minute: r.get(2)?,
+                close_minute: r.get(3)?,
+                note: r.get(4)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn upsert_calendar_day(
+        &self,
+        day: &str,
+        kind: &str,
+        open_minute: Option<i64>,
+        close_minute: Option<i64>,
+        note: &str,
+    ) -> Result<()> {
+        check_day(day)?;
+        let note = note.trim();
+        if note.is_empty() {
+            return Err(PosError::Invalid("a calendar note is required".into()));
+        }
+        match kind {
+            "closed" => {}
+            "short" | "open" => {
+                let open = open_minute
+                    .ok_or_else(|| PosError::Invalid("open minute is required".into()))?;
+                let close = close_minute
+                    .ok_or_else(|| PosError::Invalid("close minute is required".into()))?;
+                check_span(open, close)?;
+            }
+            _ => {
+                return Err(PosError::Invalid(
+                    "kind must be closed, short, or open".into(),
+                ));
+            }
+        }
+        self.conn.execute(
+            r#"
+            INSERT INTO calendar_days (day, kind, open_minute, close_minute, note)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(day) DO UPDATE SET
+                kind = excluded.kind,
+                open_minute = excluded.open_minute,
+                close_minute = excluded.close_minute,
+                note = excluded.note
+            "#,
+            params![day, kind, open_minute, close_minute, note],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_calendar_day(&self, day: &str) -> Result<()> {
+        let n = self
+            .conn
+            .execute("DELETE FROM calendar_days WHERE day = ?1", params![day])?;
+        if n == 0 {
+            return Err(PosError::NotFound(day.into()));
+        }
+        Ok(())
+    }
+
+    pub fn list_employees(&self) -> Result<Vec<Employee>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT employee_id, name, role, active FROM employees ORDER BY employee_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Employee {
+                employee_id: r.get(0)?,
+                name: r.get(1)?,
+                role: r.get(2)?,
+                active: r.get::<_, i64>(3)? != 0,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn add_employee(&self, name: &str, role: &str) -> Result<Employee> {
+        let name = name.trim();
+        let role = role.trim();
+        if name.is_empty() || role.is_empty() {
+            return Err(PosError::Invalid("name and role are required".into()));
+        }
+        if name.len() > 80 || role.len() > 40 {
+            return Err(PosError::Invalid("name or role is too long".into()));
+        }
+        let last: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT employee_id FROM employees ORDER BY employee_id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let next = last
+            .as_deref()
+            .and_then(|id| id.strip_prefix("EMP-"))
+            .and_then(|n| n.parse::<i64>().ok())
+            .unwrap_or(0)
+            + 1;
+        let employee_id = format!("EMP-{next:03}");
+        self.conn.execute(
+            "INSERT INTO employees (employee_id, name, role, active) VALUES (?1, ?2, ?3, 1)",
+            params![employee_id, name, role],
+        )?;
+        Ok(Employee {
+            employee_id,
+            name: name.into(),
+            role: role.into(),
+            active: true,
+        })
+    }
+
+    pub fn set_employee_active(&self, employee_id: &str, active: bool) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE employees SET active = ?2 WHERE employee_id = ?1",
+            params![employee_id, i64::from(active)],
+        )?;
+        if n == 0 {
+            return Err(PosError::NotFound(employee_id.into()));
+        }
+        Ok(())
+    }
+
+    fn seed_floor(&self) -> Result<()> {
+        self.install_standard_week()?;
+        let days = [
+            ("2026-12-24", "closed", None, None, "Christmas Eve"),
+            ("2026-12-26", "closed", None, None, "Boxing Day"),
+            (
+                "2026-12-31",
+                "short",
+                Some(10 * 60),
+                Some(14 * 60),
+                "New Year's Eve",
+            ),
+        ];
+        for (day, kind, open_minute, close_minute, note) in days {
+            self.conn.execute(
+                r#"
+                INSERT OR IGNORE INTO calendar_days (day, kind, open_minute, close_minute, note)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                "#,
+                params![day, kind, open_minute, close_minute, note],
+            )?;
+        }
+        let staff = [
+            ("EMP-001", "Lukas Berger", "Clerk"),
+            ("EMP-002", "Nora Berg", "Floor"),
+            ("EMP-003", "Mira Hofer", "Manager"),
+        ];
+        for (employee_id, name, role) in staff {
+            self.conn.execute(
+                r#"
+                INSERT OR IGNORE INTO employees (employee_id, name, role, active)
+                VALUES (?1, ?2, ?3, 1)
+                "#,
+                params![employee_id, name, role],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn seed_demo(&self) -> Result<usize> {
@@ -864,6 +1124,25 @@ impl PosStore {
         for item in &items {
             self.upsert_item(item)?;
         }
+        self.seed_floor()?;
         Ok(items.len())
     }
+}
+
+fn check_span(open_minute: i64, close_minute: i64) -> Result<()> {
+    if !(0..1440).contains(&open_minute) || !(0..1440).contains(&close_minute) {
+        return Err(PosError::Invalid(
+            "minutes must be from 00:00 up to but not including 24:00".into(),
+        ));
+    }
+    if close_minute <= open_minute {
+        return Err(PosError::Invalid("close must be after open".into()));
+    }
+    Ok(())
+}
+
+fn check_day(day: &str) -> Result<()> {
+    chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
+        .map_err(|_| PosError::Invalid(format!("date must be YYYY-MM-DD, got {day}")))?;
+    Ok(())
 }

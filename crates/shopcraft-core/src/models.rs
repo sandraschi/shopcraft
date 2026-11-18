@@ -100,3 +100,30 @@ pub struct PosStatus {
     pub total_receipts: i64,
     pub gross_sales_cents: i64,
 }
+
+/// Weekday is 0 for Monday through 6 for Sunday. Minutes are from midnight.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpeningHour {
+    pub weekday: i64,
+    pub open_minute: i64,
+    pub close_minute: i64,
+    pub closed: bool,
+}
+
+/// A day that is not the normal week: closed, a short day, or an extra open day.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalendarDay {
+    pub day: String,
+    pub kind: String,
+    pub open_minute: Option<i64>,
+    pub close_minute: Option<i64>,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Employee {
+    pub employee_id: String,
+    pub name: String,
+    pub role: String,
+    pub active: bool,
+}

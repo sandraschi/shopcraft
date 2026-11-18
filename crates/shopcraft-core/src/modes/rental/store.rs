@@ -351,6 +351,17 @@ impl Store {
         Ok(out)
     }
 
+    pub fn sales_by_day(&self) -> Result<Vec<crate::sales::SalesPoint>> {
+        crate::sales::by_day(
+            &self.conn,
+            "SELECT substr(created_at, 1, 10),
+                    COALESCE(SUM(rental_fee_cents + late_fee_cents + damage_fee_cents), 0),
+                    COUNT(*)
+             FROM bookings WHERE status != 'Cancelled' GROUP BY 1 ORDER BY 1",
+        )
+        .map_err(Into::into)
+    }
+
     pub fn status(&self) -> Result<RentalStatus> {
         let fleet_skus: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM rental_items WHERE active = 1",

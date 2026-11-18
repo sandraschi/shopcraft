@@ -1,6 +1,7 @@
 pub mod error;
 pub mod models;
 pub mod modes;
+pub mod sales;
 pub mod store;
 pub mod suite;
 
@@ -207,6 +208,62 @@ impl ToolHost for ShopHost {
 mod tests {
     use super::*;
     use crate::models::CheckoutLineInput;
+
+    #[test]
+    fn retail_sales_group_onto_the_receipt_day() {
+        let mut store = PosStore::open_in_memory().expect("store");
+        store.seed_demo().expect("seed");
+        let shift = store.open_shift("Lukas", 10_000).expect("open");
+        let receipt = store
+            .checkout(&CheckoutInput {
+                shift_id: shift.shift_id,
+                items: vec![CheckoutLineInput {
+                    code: "CER-VASE-01".into(),
+                    qty: 1,
+                }],
+                discount_bps: None,
+                cash_cents: 0,
+                card_cents: 6800,
+                voucher_cents: 0,
+            })
+            .expect("sale");
+        let points = store.sales_by_day().expect("sales");
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].cents, receipt.total_cents);
+        assert_eq!(points[0].orders, 1);
+        assert_eq!(points[0].day.len(), 10);
+    }
+
+    #[test]
+    fn floor_hours_calendar_and_roster() {
+        let store = PosStore::open_in_memory().expect("store");
+        store.seed_demo().expect("seed");
+        let hours = store.list_opening_hours().expect("hours");
+        assert_eq!(hours.len(), 7);
+        assert!(hours[6].closed);
+        assert!(store.set_opening_hours(0, 600, 600, false).is_err());
+        let days = store.list_calendar_days().expect("days");
+        assert_eq!(days.len(), 3);
+        assert!(store
+            .upsert_calendar_day("nope", "closed", None, None, "bad")
+            .is_err());
+        store
+            .upsert_calendar_day("2026-12-25", "closed", None, None, "Christmas Day")
+            .expect("christmas");
+        assert_eq!(store.list_calendar_days().expect("days").len(), 4);
+        store.delete_calendar_day("2026-12-25").expect("remove");
+        let staff = store.list_employees().expect("staff");
+        assert_eq!(staff.len(), 3);
+        let added = store.add_employee("Eva Lang", "Buyer").expect("hire");
+        assert_eq!(added.employee_id, "EMP-004");
+        store
+            .set_employee_active(&added.employee_id, false)
+            .expect("deactivate");
+        let again = store.list_employees().expect("staff");
+        assert!(again
+            .iter()
+            .any(|e| e.employee_id == "EMP-004" && !e.active));
+    }
 
     #[test]
     fn split_tender_checkout_storno_and_zbon() {

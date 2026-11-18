@@ -371,6 +371,38 @@ impl AmazonStore {
         })
     }
 
+    pub fn list_orders(&self) -> Result<Vec<AmazonOrder>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT amazon_order_id, marketplace, fulfillment, status, asin, sku, qty,
+                    gross_cents, referral_fee_cents, fba_fee_cents, vat_cents, net_profit_cents,
+                    invoice_uploaded, created_at
+             FROM amazon_orders ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(AmazonOrder {
+                amazon_order_id: r.get(0)?,
+                marketplace: r.get(1)?,
+                fulfillment: r.get(2)?,
+                status: r.get(3)?,
+                asin: r.get(4)?,
+                sku: r.get(5)?,
+                qty: r.get(6)?,
+                gross_cents: r.get(7)?,
+                referral_fee_cents: r.get(8)?,
+                fba_fee_cents: r.get(9)?,
+                vat_cents: r.get(10)?,
+                net_profit_cents: r.get(11)?,
+                invoice_uploaded: r.get::<_, i64>(12)? != 0,
+                created_at: r.get(13)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub fn mark_invoice_uploaded(&self, amazon_order_id: &str) -> Result<()> {
         let rows = self.conn.execute(
             "UPDATE amazon_orders SET invoice_uploaded = 1 WHERE amazon_order_id = ?1",
@@ -380,6 +412,15 @@ impl AmazonStore {
             return Err(AmazonError::NotFound(format!("order {amazon_order_id}")));
         }
         Ok(())
+    }
+
+    pub fn sales_by_day(&self) -> Result<Vec<crate::sales::SalesPoint>> {
+        crate::sales::by_day(
+            &self.conn,
+            "SELECT substr(created_at, 1, 10), COALESCE(SUM(gross_cents), 0), COUNT(*)
+             FROM amazon_orders WHERE status != 'CANCELLED' GROUP BY 1 ORDER BY 1",
+        )
+        .map_err(Into::into)
     }
 
     pub fn status(&self) -> Result<AmazonStatus> {
@@ -500,5 +541,29 @@ impl AmazonStore {
             self.upsert_listing(l)?;
         }
         Ok(listings.len())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recorded_order_is_listed() {
+        let store = AmazonStore::open_in_memory().expect("store");
+        store.seed_demo().expect("seed");
+        store
+            .record_order(&RecordOrderInput {
+                amazon_order_id: "UI-1".into(),
+                asin: "B0ATELIER1".into(),
+                qty: 1,
+                status: "UNSHIPPED".into(),
+            })
+            .expect("record");
+        let orders = store.list_orders().expect("list");
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].sku, "CER-VASE-01");
+        assert!(!orders[0].invoice_uploaded);
     }
 }
