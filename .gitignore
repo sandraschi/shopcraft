@@ -1,4 +1,8 @@
 /target
+dist/
+*.bak
+*.bak.*
+.env
 *.db
 *.db-wal
 *.db-shm
