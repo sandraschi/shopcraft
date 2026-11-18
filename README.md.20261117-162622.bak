@@ -1,0 +1,109 @@
+# ShopCraft
+
+![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)
+![Rust 1.90+](https://img.shields.io/badge/rust-1.90%2B-orange?logo=rust)
+![MCP stdio](https://img.shields.io/badge/MCP-stdio-purple)
+![ArtCraft harness](https://img.shields.io/badge/ArtCraft-harness-green)
+
+## Install
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-craft.ps1
+```
+
+One repo, eight storefront modes, one SQLite file per mode under a data directory.
+
+## Feature matrix
+
+| Feature | Status | Where |
+|---|---|---|
+| Retail shift, split tender, storno, Z-Bon, thermal preview | Implemented | `--mode retail` (default), tools `shop_*` and `retail_*` |
+| Web catalog, promo, shipping zone, order pay/ship | Implemented | `--mode web`, tools `webshop_*` |
+| Amazon unit economics and local Buy Box clamp | Implemented | `--mode amazon`, `amazon_reprice` clamps to min/max from a supplied competitor price. No Amazon API. |
+| Subscription cadence, skip, pause, swap, IBAN stored | Implemented | `--mode subscription`, tools `sub_*` |
+| SEPA pain.008 file | Planned | Mandate reference is stored. No pain.008 XML is written. |
+| Digital license keys and per-country VAT rate at checkout | Implemented | `--mode digital`. Keys are unique per order. |
+| EU VAT OSS return filing | Planned | The rate table is local. Nothing is filed. |
+| Wholesale MOQ, pack size, tier discount, reverse-charge quote | Implemented | `--mode wholesale`, `wholesale_quote` |
+| Ticket capacity, check-in, refund | Implemented | `--mode ticket` |
+| Rental overlap, checkout, late fee | Implemented | `--mode rental` |
+| Desktop desks for all eight modes | Implemented | `shopcraft-app`. Retail is the register. The other pages list rows and run the same store calls as the CLI. |
+| HTML web storefront with product photos | Implemented | Web page **Open webshop**, or menu **Shop > Open webshop**. Photos live in `storefront\assets`. |
+| Browser checkout writing the desk | Planned | The page shows the catalog. Checkout does not insert a SQLite order. |
+| Stockcraft quantity update on a sale | Planned | The shop writes a bus file. Stockcraft's inbox drain rejects it. Reorder stays in stockcraft. |
+| Chat in the desktop window | Planned | `chat_panel` is empty. There is no model picker. |
+| Live payment, carrier, or marketplace connectors | Planned | Every mode is offline SQLite. |
+
+## Modes
+
+`retail` `web` `amazon` `subscription` `digital` `wholesale` `ticket` `rental`
+
+```powershell
+cargo run -p shopcraft-mcp -- --mode retail seed
+cargo run -p shopcraft-mcp -- --mode wholesale status
+cargo run -p shopcraft-mcp -- --mode digital tool digital_catalog
+cargo run -p shopcraft-mcp -- mcp
+cargo run -p shopcraft-app
+```
+
+`--db` is a directory. Default `shopcraft-data`. The desktop app uses `%LOCALAPPDATA%\shopcraft` (`retail.db`, `web.db`, and one file per other mode). The old single-file `shopcraft.db` is not migrated.
+
+MCP exposes every mode on one stdio server. Retail tools keep the `shop_*` names and also answer as `retail_*`.
+
+`dist\shopcraft-app.exe` is the 16 November binary. The window described here is `target\debug\shopcraft-app.exe` from `cargo run -p shopcraft-app`.
+
+## Desktop window
+
+| Page | What you can do |
+|---|---|
+| Retail | Open a shift, sell one, preview the receipt, close and print a Z-Bon |
+| Web | Seed, order one, mark paid, ship, open the HTML shop |
+| Amazon | Seed, show profit per unit, undercut by 1.00 within the floor and ceiling, record a sale, mark the invoice |
+| Subscription | Seed, subscribe, bill, skip, pause, resume. No pain.008 file |
+| Digital | Seed, buy (Austria rate), show the license key, redeem a download, revoke |
+| Wholesale | Seed, quote MOQ, place the order, approve, dispatch, invoice |
+| Ticket | Seed, sell one, check in, refund |
+| Rental | Seed, book the shown date window, check out, return on the end date |
+
+Empty pages need **Seed demo** once. Counts on each page are that mode's own SQLite rows. Modes do not share a catalog, stock figure, or customer.
+
+## Web storefront
+
+`storefront\` holds `index.html`, `styles.css`, `app.js`, and six product photos under `storefront\assets\`. **Open webshop** copies that page next to a live `catalog.js` in `%LOCALAPPDATA%\shopcraft\web-storefront` and opens it in the browser. Product cards and the hero use those photos. Search, bag, and theme controls stay small icons.
+
+If the web database has no products, the page shows its built-in sample and the status line says so.
+
+## Stock
+
+A web or retail sale changes only that mode's own quantity. The web **Order 1** button turns off at 0, and checkout refuses an oversell.
+
+The shop also drops a JSON event in `%LOCALAPPDATA%\craft-biz\bus\stockcraft\inbox`:
+
+| Shop action | Event kind | Source name |
+|---|---|---|
+| Retail checkout | `channel.sale_committed` | `shopcraft` |
+| Retail storno | `channel.return_restocked` | `shopcraft` |
+| Web order | `channel.stock_reserved` | `webshopcraft` |
+
+Stockcraft applies `invoice.issued` and `bom.exported` only. It rejects the shop events, so warehouse quantity does not move.
+
+To order new stock, use stockcraft: set Meldebestand on the SKU, run **Reorder plan**, then receive goods with `stock_receive`. Shopcraft does not buy from suppliers. The wholesale page sells to trade accounts.
+
+## Layout
+
+| Layer | Crate | Role |
+|---|---|---|
+| L1 | `crates/shopcraft-core` | Shared suite plus one module per mode |
+| L2 | `crates/shopcraft-mcp` | `shopcraft` CLI (`--mode`) and MCP stdio |
+| L3 | `crates/shopcraft-app` | egui desks. Web page publishes `storefront\` |
+
+## Verification
+
+```powershell
+cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
+
+## License
+
+MIT OR Apache-2.0

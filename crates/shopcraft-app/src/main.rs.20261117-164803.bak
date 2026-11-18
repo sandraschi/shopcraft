@@ -1,0 +1,420 @@
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+mod desk;
+mod webfront;
+
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use craft_biz::bus::Bus;
+use craft_biz::mcp::ToolHost;
+use craft_biz::Money;
+use craft_biz_ui::app::{main_with, AppMenus, Frame, NavEntry, SuiteApp, Wiring};
+use craft_biz_ui::menu::{Item, Menu};
+use craft_biz_ui::theme::Tone;
+use craft_biz_ui::widgets::{self, Kpi};
+use egui::{Grid, RichText, ScrollArea, Ui};
+use serde_json::{json, Value};
+use shopcraft_core::models::{PosItem, PosStatus, Shift};
+use shopcraft_core::suite::ShopSuite;
+
+struct ShopApp {
+    suite: ShopSuite,
+    items: Vec<PosItem>,
+    status: Option<PosStatus>,
+    active_shift: Option<Shift>,
+    last_receipt_text: String,
+    desk: desk::Desk,
+    notice: String,
+    rental_slot: usize,
+    mode: usize,
+}
+
+impl ShopApp {
+    fn open(path: &Path) -> Result<Self, String> {
+        let suite = ShopSuite::open(path)?;
+        let mut app = Self {
+            suite,
+            items: Vec::new(),
+            status: None,
+            active_shift: None,
+            last_receipt_text: String::new(),
+            desk: desk::Desk::empty(),
+            notice: String::new(),
+            rental_slot: 0,
+            mode: 0,
+        };
+        app.reload()?;
+        Ok(app)
+    }
+
+    fn view_retail(&mut self, ui: &mut Ui, f: &mut Frame, section: usize) {
+        let title = match section {
+            0 => "Stats",
+            1 => "Register",
+            2 => "Catalog",
+            _ => "Shift",
+        };
+        ui.heading(title);
+        ui.add_space(6.0);
+        if section == 0 {
+            if let Some(st) = &self.status {
+                widgets::kpi_row(
+                    ui,
+                    &[
+                        Kpi::new("Active Items", st.active_items.to_string()),
+                        Kpi::new(
+                            "Open Shift",
+                            st.open_shift.clone().unwrap_or_else(|| "None".into()),
+                        ),
+                        Kpi::new("Receipts", st.total_receipts.to_string()),
+                        Kpi::new(
+                            "Gross Sales",
+                            Money::from_cents(st.gross_sales_cents).to_string(),
+                        ),
+                    ],
+                );
+            }
+            ui.add_space(8.0);
+            if ui.button("Seed demo items").clicked() {
+                match self.suite.call("shop_seed", &json!({})) {
+                    Ok(_) => {
+                        let _ = self.reload();
+                        f.toast("Retail catalog seeded", Tone::Teal);
+                    }
+                    Err(e) => f.toast(e, Tone::Danger),
+                }
+            }
+            ui.label("These counts belong to this till. They are not stockcraft on-hand.");
+            return;
+        }
+        if section == 3 {
+            ui.label(
+                "Open the till, sell on Register, then close it here. The close writes a Z-Bon.",
+            );
+            ui.add_space(8.0);
+            if self.active_shift.is_none() {
+                if ui.button("Open Shift (Lukas, EUR 100.00)").clicked() {
+                    match self.suite.call(
+                        "shop_shift_open",
+                        &json!({ "clerk_name": "Lukas", "opening_float_cents": 10000 }),
+                    ) {
+                        Ok(_) => {
+                            let _ = self.reload();
+                            f.toast("Shift opened", Tone::Teal);
+                        }
+                        Err(e) => f.toast(e, Tone::Danger),
+                    }
+                }
+            } else if let Some(sh) = self.active_shift.clone() {
+                ui.label(format!(
+                    "Open shift {} clerk {}",
+                    sh.shift_id, sh.clerk_name
+                ));
+                if ui.button("Close Shift and write Z-Bon").clicked() {
+                    match self.suite.call(
+                        "shop_shift_close",
+                        &json!({ "shift_id": sh.shift_id, "counted_cash_cents": sh.expected_cash_cents }),
+                    ) {
+                        Ok(_) => {
+                            let _ = self.reload();
+                            f.toast("Shift closed. Z-Bon sent toward buchcraft.", Tone::Teal);
+                        }
+                        Err(e) => f.toast(e, Tone::Danger),
+                    }
+                }
+            }
+            return;
+        }
+
+        let sell = section == 1;
+        if sell && self.active_shift.is_none() {
+            ui.label("No shift is open. Open one on Shift before selling.");
+        }
+        ui.add_space(8.0);
+        ScrollArea::vertical().show(ui, |ui| {
+            Grid::new("pos_items_grid").striped(true).show(ui, |ui| {
+                ui.strong("SKU");
+                ui.strong("EAN-13");
+                ui.strong("Title");
+                ui.strong("Price");
+                ui.strong("Stock");
+                if sell {
+                    ui.strong("Sale");
+                }
+                ui.end_row();
+
+                let items = self.items.clone();
+                for it in items {
+                    ui.label(&it.sku);
+                    ui.label(&it.barcode);
+                    ui.label(&it.title);
+                    ui.label(Money::from_cents(it.price_cents).to_string());
+                    ui.label(it.stock_qty.to_string());
+                    if sell {
+                        let can_sell = self.active_shift.is_some() && it.stock_qty > 0;
+                        if ui
+                            .add_enabled(can_sell, egui::Button::new("Sell 1x"))
+                            .clicked()
+                        {
+                            if let Some(sh) = &self.active_shift {
+                                match self.suite.call(
+                                    "shop_checkout",
+                                    &json!({
+                                        "shift_id": sh.shift_id,
+                                        "items": [{ "code": it.sku, "qty": 1 }],
+                                        "cash_cents": 0,
+                                        "card_cents": it.price_cents,
+                                        "voucher_cents": 0
+                                    }),
+                                ) {
+                                    Ok(val) => {
+                                        if let Some(rno) =
+                                            val.get("receipt_no").and_then(Value::as_str)
+                                        {
+                                            self.last_receipt_text = self
+                                                .suite
+                                                .retail
+                                                .store
+                                                .format_receipt_text(rno)
+                                                .unwrap_or_default();
+                                        }
+                                        let _ = self.reload();
+                                        f.toast("Sale completed", Tone::Teal);
+                                    }
+                                    Err(e) => f.toast(e, Tone::Danger),
+                                }
+                            }
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+            if sell {
+                ui.add_space(12.0);
+                ui.label(RichText::new("42-Col ESC/POS Receipt Preview").strong());
+                let text = if self.last_receipt_text.is_empty() {
+                    "Complete a sale to preview the thermal receipt."
+                } else {
+                    self.last_receipt_text.as_str()
+                };
+                ui.monospace(text);
+            }
+        });
+    }
+
+    fn open_webshop(&mut self, f: &mut Frame) {
+        match webfront::open(self) {
+            Ok(msg) => {
+                self.notice = msg;
+                f.toast("Webshop opened in the browser", Tone::Teal);
+            }
+            Err(err) => {
+                self.notice = err.clone();
+                f.toast(err, Tone::Danger);
+            }
+        }
+    }
+}
+
+impl SuiteApp for ShopApp {
+    fn name(&self) -> &'static str {
+        "ShopCraft"
+    }
+    fn id(&self) -> &'static str {
+        "shopcraft"
+    }
+    fn tone(&self) -> Tone {
+        Tone::Warn
+    }
+    fn version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
+    fn tools(&self) -> Vec<Value> {
+        self.suite.tools()
+    }
+    fn call(&mut self, tool: &str, args: &Value) -> Result<Value, String> {
+        let out = self.suite.call(tool, args)?;
+        let _ = self.reload();
+        Ok(out)
+    }
+    fn reload(&mut self) -> Result<(), String> {
+        self.items = self
+            .suite
+            .retail
+            .store
+            .list_items(None)
+            .map_err(|e| e.to_string())?;
+        let st = self
+            .suite
+            .retail
+            .store
+            .status()
+            .map_err(|e| e.to_string())?;
+        self.active_shift = match &st.open_shift {
+            Some(id) => self.suite.retail.store.get_shift(id).ok(),
+            None => None,
+        };
+        self.status = Some(st);
+        self.desk = desk::Desk::load(&self.suite)?;
+        Ok(())
+    }
+    fn nav(&self, _f: &Frame) -> Vec<NavEntry> {
+        let spec: &[(&str, &str, &str)] = match self.mode {
+            0 => &[
+                ("Floor", "S", "Stats"),
+                ("", "R", "Register"),
+                ("", "C", "Catalog"),
+                ("Till", "Z", "Shift"),
+            ],
+            1 => &[
+                ("Shop", "S", "Stats"),
+                ("", "C", "Catalog"),
+                ("", "O", "Orders"),
+                ("Delivery", "D", "Shipping"),
+            ],
+            2 => &[
+                ("Shop", "S", "Stats"),
+                ("", "L", "Listings"),
+                ("", "O", "Orders"),
+                ("Supply", "P", "Replenish"),
+            ],
+            3 => &[
+                ("Club", "S", "Stats"),
+                ("", "P", "Plans"),
+                ("", "U", "Subscribers"),
+            ],
+            4 => &[
+                ("Vault", "S", "Stats"),
+                ("", "C", "Catalog"),
+                ("", "O", "Orders"),
+                ("", "K", "Licenses"),
+            ],
+            5 => &[
+                ("Trade", "S", "Stats"),
+                ("", "A", "Accounts"),
+                ("", "C", "Catalog"),
+                ("", "O", "Orders"),
+            ],
+            6 => &[
+                ("Box office", "S", "Stats"),
+                ("", "E", "Events"),
+                ("", "T", "Tickets"),
+            ],
+            _ => &[
+                ("Fleet", "S", "Stats"),
+                ("", "G", "Gear"),
+                ("", "B", "Bookings"),
+            ],
+        };
+        let mut entries = Vec::new();
+        for (group, icon, label) in spec {
+            let mut entry = NavEntry::new(icon, *label);
+            if !group.is_empty() {
+                entry = entry.group(*group);
+            }
+            entries.push(entry);
+        }
+        entries
+    }
+    fn view(&mut self, ui: &mut Ui, view: usize, f: &mut Frame) {
+        match self.mode {
+            0 => self.view_retail(ui, f, view),
+            1 => desk::web(self, ui, f, view),
+            2 => desk::amazon(self, ui, f, view),
+            3 => desk::subscription(self, ui, f, view),
+            4 => desk::digital(self, ui, f, view),
+            5 => desk::wholesale(self, ui, f, view),
+            6 => desk::tickets(self, ui, f, view),
+            7 => desk::rental(self, ui, f, view),
+            _ => {
+                ui.label("Unknown shop");
+            }
+        }
+    }
+    fn menus(&self, _f: &Frame) -> AppMenus {
+        let modes = [
+            "Retail",
+            "Web",
+            "Amazon",
+            "Subscription",
+            "Digital",
+            "Wholesale",
+            "Ticket",
+            "Rental",
+        ];
+        let mode_items = modes
+            .iter()
+            .enumerate()
+            .map(|(i, name)| Item::action(*name, &format!("shop.mode.{i}")).checked(self.mode == i))
+            .collect();
+        AppMenus {
+            middle: vec![Menu::new(
+                "Shop",
+                vec![
+                    Item::sub("Mode", mode_items),
+                    Item::sep(),
+                    Item::action("Open webshop", "shop.open_web"),
+                ],
+            )],
+            ..AppMenus::default()
+        }
+    }
+    fn menu_action(&mut self, id: &str, f: &mut Frame) {
+        if let Some(rest) = id.strip_prefix("shop.mode.") {
+            if let Ok(mode) = rest.parse::<usize>() {
+                if mode < 8 {
+                    self.mode = mode;
+                    f.goto(0);
+                }
+            }
+            return;
+        }
+        if id == "shop.open_web" {
+            self.open_webshop(f);
+        }
+    }
+    fn status_info(&self) -> String {
+        let name = [
+            "Retail",
+            "Web",
+            "Amazon",
+            "Subscription",
+            "Digital",
+            "Wholesale",
+            "Ticket",
+            "Rental",
+        ]
+        .get(self.mode)
+        .copied()
+        .unwrap_or("Shop");
+        format!("{name} shop")
+    }
+    fn bus(&self) -> &Bus {
+        &self.suite.retail.bus
+    }
+    fn wiring(&self) -> Wiring {
+        (
+            vec![("stock.available_changed", "Refresh local POS stock counts")],
+            vec![
+                ("channel.sale_committed", "Deduct GoodsOut in stockcraft"),
+                ("channel.return_restocked", "Restock Storno in stockcraft"),
+                ("pos.zbon_closed", "Post Z-Bon daily revenue to buchcraft"),
+            ],
+        )
+    }
+    fn smoke_tool(&self) -> &'static str {
+        "shop_status"
+    }
+}
+
+fn default_db() -> PathBuf {
+    let base = std::env::var("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    base.join("shopcraft")
+}
+
+fn main() -> ExitCode {
+    main_with(default_db(), ShopApp::open, "shop_seed")
+}

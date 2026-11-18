@@ -1,0 +1,5 @@
+a75ab40220ef83a4aa05ffe3cf04aa96ce8efebcc089a8d7f76b12ea23079dc8  shopcraft-0.1.0-setup.exe
+83ae2338e2bd6d59d979bbc816f8b6e228eedd6d4fc5bfdc798ff821284bc933  shopcraft-0.1.0-windows-x64-portable.zip
+8a607d17f1f3d0326f33f9dfd95c9084b9df5ff14eed9fb90b5627178d73d7bf  shopcraft-app.exe
+cc3778bf429e80bd96fd533cd565dc22ff1d814c1099977fbf02b243a2cdbefc  shopcraft-v0.1.0.mcpb
+d90a890e3ff1a8e17caf6c03ae33014099fcbf81fc1f3ae65b6d876037724166  shopcraft.exe
