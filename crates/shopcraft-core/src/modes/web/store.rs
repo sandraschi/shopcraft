@@ -639,6 +639,15 @@ impl Store {
         Ok(())
     }
 
+    pub fn sales_by_day(&self) -> Result<Vec<crate::sales::SalesPoint>> {
+        crate::sales::by_day(
+            &self.conn,
+            "SELECT substr(created_at, 1, 10), COALESCE(SUM(total_cents), 0), COUNT(*)
+             FROM orders WHERE status NOT IN ('CANCELLED', 'REFUNDED') GROUP BY 1 ORDER BY 1",
+        )
+        .map_err(Into::into)
+    }
+
     pub fn status(&self) -> Result<ShopStatus> {
         let active_products: i64 =
             self.conn
@@ -773,7 +782,7 @@ impl Store {
                 accent_hex: "#5C4B3B".into(),
                 material: "Fumed European Oak".into(),
                 dimensions: "26 x 14 x 2.2 cm".into(),
-                image_url: None,
+                image_url: Some("assets/wrk-tray-04.jpg".into()),
                 featured: false,
                 active: true,
             },
@@ -792,7 +801,7 @@ impl Store {
                 accent_hex: "#2E3440".into(),
                 material: "Basalt Porcelain".into(),
                 dimensions: "90 ml each".into(),
-                image_url: None,
+                image_url: Some("assets/cer-mug-05.jpg".into()),
                 featured: false,
                 active: true,
             },
@@ -811,7 +820,7 @@ impl Store {
                 accent_hex: "#3B5978".into(),
                 material: "Belgian Linen & Munken".into(),
                 dimensions: "A5 (148 x 210 mm)".into(),
-                image_url: None,
+                image_url: Some("assets/wrk-note-06.jpg".into()),
                 featured: false,
                 active: true,
             },
